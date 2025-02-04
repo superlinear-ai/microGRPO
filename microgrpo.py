@@ -186,11 +186,11 @@ class GRPOConfig:
     policy: PolicyFunction
     reference_policy: ReferencePolicyFunction
 
-    ε: float = 0.2  # Advantage clip epsilon
+    ε: float = 0.2  # Policy ratio clip epsilon
     ß: float = 0.0  # Weight for KL divergence between the policy and the reference policy
     G: int = 8  # Number of trajectories per group
     B: int = 8  # Number of groups per mini-batch
-    M: int = 1024  # Number of mini-batches to train on
+    M: int = 2048  # Number of mini-batches to train on
     μ: int = 10  # Number of gradient steps per mini-batch
     random_state: np.random.RandomState = np.random.RandomState(42)
 
@@ -254,7 +254,7 @@ def grpo_objective(
             π_ref_t = grpo_config.reference_policy(observation)[action]
             ratio = π_θ_t / π_θ_t_old
             clipped_ratio = np.clip(π_θ_t / π_θ_t_old, 1 - grpo_config.ε, 1 + grpo_config.ε)
-            grpo += min(ratio, clipped_ratio) * advantage / len(actions)  # Advantage
+            grpo += min(ratio * advantage, clipped_ratio * advantage) / len(actions)  # Advantage
             grpo += -grpo_config.ß * (π_ref_t / π_θ_t - np.log(π_ref_t / π_θ_t) - 1) / len(actions)  # KL divergence
     grpo /= grpo_config.G
     grpo = -grpo  # Flip the sign to turn the maximization problem into a minimization problem.
