@@ -120,8 +120,8 @@ class BattleshipEnv(Environment):
 
     def sample_action(self, action_proba: ActionProbaArray) -> int:
         # Mask out illegal actions.
-        legal_actions = np.ravel(self.observation == 0.0).astype(np.float32)
-        action_proba *= legal_actions
+        illegal_actions = np.ravel(self.observation != 0.0)
+        action_proba[illegal_actions] = 0.0
         action_proba /= np.sum(action_proba)
         # Sample an action from the probability distribution.
         action = int(self.random_state.choice(len(action_proba), p=action_proba))
@@ -188,10 +188,10 @@ class GRPOConfig:
     policy: PolicyFunction
     reference_policy: ReferencePolicyFunction
 
-    ε: float = 0.2  # Policy ratio clip epsilon
+    ε: float = 0.9  # Policy ratio clip epsilon
     ß: float = 0.0  # Weight for KL divergence between the policy and the reference policy
-    G: int = 8  # Number of trajectories per group
-    B: int = 8  # Number of groups per mini-batch
+    G: int = 16  # Number of trajectories per group
+    B: int = 4  # Number of groups per mini-batch
     M: int = 2048  # Number of mini-batches to train on
     μ: int = 10  # Number of gradient steps per mini-batch
 
@@ -210,10 +210,12 @@ def collect_group(
     group_actions = [np.empty(grpo_config.environment.max_steps, dtype=np.intp) for _ in range(grpo_config.G)]
     group_actions_proba = [np.empty(grpo_config.environment.max_steps, dtype=np.float32) for _ in range(grpo_config.G)]
     group_rewards = np.zeros(grpo_config.G, dtype=np.float32)
+    # Create a fixed environment initialization seed.
+    init_seed = env_seed if env_seed is not None else np.random.randint(2**32)
     # Generate trajectories starting from the initial environment.
     for group in range(grpo_config.G):
-        # Start a new environment (a game).
-        env, observation = grpo_config.environment.reset(init_seed=env_seed, step_seed=group)
+        # Start a new environment (a game) from a fixed initial seed.
+        env, observation = grpo_config.environment.reset(init_seed=init_seed, step_seed=init_seed * group)
         for step in range(env.max_steps):
             # Evaluate the policy model to obtain the action probability distribution.
             action_proba = grpo_config.policy(policy_params, observation)
@@ -292,13 +294,13 @@ def train_grpo(optimizer: AdamWOptimizer, grpo_config: GRPOConfig) -> tuple[Para
     rewards_val = np.zeros(grpo_config.M, dtype=np.float32)
     for iter in (pbar := tqdm(range(grpo_config.M))):
         # Collect a mini-batch of groups of trajectories to learn from.
-        groups = [collect_group(optimizer.params, grpo_config) for _ in range(grpo_config.B)]
+        groups = [collect_group(optimizer.params, grpo_config, env_seed=(iter + 1) * 128 + i) for i in range(grpo_config.B)]
         # Optimize the GRPO objective determined by the current mini-batch for a few steps.
         for _ in range(grpo_config.μ):
             # Compute the gradient and update the solution.
             optimizer.step(grpo_objective_batch_grad(optimizer.params, groups, grpo_config))
         # Track progress of the validation reward.
-        groups_val = [collect_group(optimizer.params, replace(grpo_config, G=16), env_seed=i) for i in range(32)]
+        groups_val = [collect_group(optimizer.params, replace(grpo_config, G=8), env_seed=i) for i in range(64)]
         rewards_val[iter] = sum(np.mean(group_val[3]) for group_val in groups_val) / len(groups_val)
         pbar.set_description(f"reward_val={rewards_val[iter]:.3f}")
     return optimizer.params, rewards_val

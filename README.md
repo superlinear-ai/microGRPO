@@ -21,7 +21,9 @@ To start teaching a policy to play a simplified version of [Battleship](https://
 uv run microgrpo.py
 ```
 
-You should see that the policy learns to improve its average score from around 17% to about 48% over 2000 iterations.
+You should see that the policy learns to improve its average score from around 15% to about 49% over 2000 iterations:
+
+![Battleship policy trained with GRPO](https://github.com/user-attachments/assets/bfebd746-cd8f-4cba-b056-3224db4965fd)
 
 ## Background
 
