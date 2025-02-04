@@ -5,7 +5,6 @@
 # ///
 
 from abc import ABC, abstractmethod
-from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Callable, TypeAlias
 
@@ -35,8 +34,9 @@ class BattleshipGame:
     rules: BattleshipGameRules = field(default_factory=BattleshipGameRules)
 
     @staticmethod
-    def random_board(rules: BattleshipGameRules | None = None) -> BattleshipGameBoard:
+    def random_board(rules: BattleshipGameRules | None = None, seed: int | None = None) -> BattleshipGameBoard:
         rules = rules or BattleshipGameRules()
+        random_state = np.random.RandomState(seed)
         ships = [ship_size for ship_size, ship_count in enumerate(rules.ships) for _ in range(ship_count)]
         ships_placed = False
         while not ships_placed:
@@ -44,9 +44,9 @@ class BattleshipGame:
             for ship_size in ships:
                 if ship_size > rules.board_size:
                     return
-                ship_top_left = np.random.randint(low=0, high=rules.board_size - (ship_size - 1), size=2)
+                ship_top_left = random_state.randint(low=0, high=rules.board_size - (ship_size - 1), size=2)
                 ship_bottom_right = ship_top_left + 1
-                ship_bottom_right[np.random.randint(low=0, high=2)] += ship_size - 1
+                ship_bottom_right[random_state.randint(low=0, high=2)] += ship_size - 1
                 if np.all(board[ship_top_left[0] : ship_bottom_right[0], ship_top_left[1] : ship_bottom_right[1]] == "🌊"):
                     board[ship_top_left[0] : ship_bottom_right[0], ship_top_left[1] : ship_bottom_right[1]] = "🚢"
                 else:
@@ -62,7 +62,8 @@ class BattleshipGame:
 
     def score(self) -> float:
         done = not np.any(self.board == "🚢")
-        return 1.0 - np.sum(self.board == "💦") / (self.board.size - np.sum(self.board == "💥") + 1) if done else 0.0
+        efficiency: float = 1.0 - np.sum(self.board == "💦") / (self.board.size - np.sum(self.board == "💥") + 1) if done else 0.0
+        return efficiency
 
     def __repr__(self) -> str:
         return "\n".join("".join(row) for row in self.board)
@@ -70,39 +71,39 @@ class BattleshipGame:
 
 # --- Environment ---
 
+ActionProbaArray: TypeAlias = np.ndarray[tuple[int], np.float32]
 ObservationArray: TypeAlias = np.ndarray[tuple[int, ...], np.float32]
 
 
 class Environment(ABC):
+    max_steps: int
+
     @property
     @abstractmethod
     def observation(self) -> ObservationArray:
         pass
 
-    @property
-    @abstractmethod
-    def max_steps(self) -> int:
-        pass
-
     @classmethod
     @abstractmethod
-    def reset(cls) -> tuple["Environment", ObservationArray]:
+    def reset(cls, init_seed: int | None = None, step_seed: int | None = None) -> tuple["Environment", ObservationArray]:
+        pass
+
+    @abstractmethod
+    def sample_action(self, action_proba: ActionProbaArray) -> int:
         pass
 
     @abstractmethod
     def step(self, action: int) -> tuple[ObservationArray, float, bool]:
         pass
 
-    @abstractmethod
-    def legal_actions(self) -> np.ndarray[tuple[int], np.float32]:
-        pass
-
 
 class BattleshipEnv(Environment):
     rules = BattleshipGameRules()
+    max_steps = rules.board_size**2
 
-    def __init__(self) -> None:
-        self.state = BattleshipGame(board=BattleshipGame.random_board(self.rules), rules=self.rules)
+    def __init__(self, init_seed: int | None = None, step_seed: int | None = None) -> None:
+        self.state = BattleshipGame(board=BattleshipGame.random_board(self.rules, init_seed), rules=self.rules)
+        self.random_state = np.random.RandomState(step_seed)
 
     @property
     def observation(self) -> ObservationArray:
@@ -112,14 +113,19 @@ class BattleshipEnv(Environment):
         encoded_board[self.state.board == "💥"] = 1.0
         return encoded_board
 
-    @property
-    def max_steps(self) -> int:
-        return int(self.state.board.size)
-
     @classmethod
-    def reset(cls) -> tuple["BattleshipEnv", ObservationArray]:
-        env = cls()
+    def reset(cls, init_seed: int | None = None, step_seed: int | None = None) -> tuple["BattleshipEnv", ObservationArray]:
+        env = cls(init_seed, step_seed)
         return env, env.observation
+
+    def sample_action(self, action_proba: ActionProbaArray) -> int:
+        # Mask out illegal actions.
+        legal_actions = np.ravel(self.observation == 0.0).astype(np.float32)
+        action_proba *= legal_actions
+        action_proba /= np.sum(action_proba)
+        # Sample an action from the probability distribution.
+        action = int(self.random_state.choice(len(action_proba), p=action_proba))
+        return action
 
     def step(self, action: int) -> tuple[ObservationArray, float, bool]:
         self.state.play(fire=divmod(action, self.state.rules.board_size))
@@ -127,15 +133,11 @@ class BattleshipEnv(Environment):
         done = reward > 0.0
         return self.observation, reward, done
 
-    def legal_actions(self) -> np.ndarray[tuple[int], np.float32]:
-        return np.ravel(self.observation == 0.0).astype(np.float32)
-
 
 # --- Policy ---
 
 
 ParamsDict: TypeAlias = dict[str, np.ndarray[tuple[int, ...], np.float32]]
-ActionProbaArray: TypeAlias = np.ndarray[tuple[int], np.float32]
 
 
 def neural_battleship_policy_init(rules: BattleshipGameRules | None = None, seed: int = 42) -> ParamsDict:
@@ -192,11 +194,10 @@ class GRPOConfig:
     B: int = 8  # Number of groups per mini-batch
     M: int = 2048  # Number of mini-batches to train on
     μ: int = 10  # Number of gradient steps per mini-batch
-    random_state: np.random.RandomState = np.random.RandomState(42)
 
 
 def collect_group(
-    policy_params: ParamsDict, grpo_config: GRPOConfig
+    policy_params: ParamsDict, grpo_config: GRPOConfig, env_seed: int | None = None
 ) -> tuple[
     list[list[ObservationArray]],
     list[ActionProbaArray],
@@ -204,27 +205,24 @@ def collect_group(
     RewardArray,
     AdvantageArray,
 ]:
-    # Start a new environment (a game).
-    initial_env, observation = grpo_config.environment.reset()
     # Initialize the group output.
     group_observations: list[list[ObservationArray]] = [[] for _ in range(grpo_config.G)]
-    group_actions = [np.empty(initial_env.max_steps, dtype=np.intp) for _ in range(grpo_config.G)]
-    group_actions_proba = [np.empty(initial_env.max_steps, dtype=np.float32) for _ in range(grpo_config.G)]
+    group_actions = [np.empty(grpo_config.environment.max_steps, dtype=np.intp) for _ in range(grpo_config.G)]
+    group_actions_proba = [np.empty(grpo_config.environment.max_steps, dtype=np.float32) for _ in range(grpo_config.G)]
     group_rewards = np.zeros(grpo_config.G, dtype=np.float32)
     # Generate trajectories starting from the initial environment.
     for group in range(grpo_config.G):
-        env = deepcopy(initial_env)
+        # Start a new environment (a game).
+        env, observation = grpo_config.environment.reset(init_seed=env_seed, step_seed=group)
         for step in range(env.max_steps):
             # Evaluate the policy model to obtain the action probability distribution.
-            p = grpo_config.policy(policy_params, observation)
-            p *= env.legal_actions()  # Mask out illegal actions.
-            p /= np.sum(p)
+            action_proba = grpo_config.policy(policy_params, observation)
             # Sample an action from the policy's action probability distribution.
-            action = grpo_config.random_state.choice(len(p), p=p)
+            action = env.sample_action(action_proba)
             # Update the group output.
             group_observations[group].append(observation)
             group_actions[group][step] = action
-            group_actions_proba[group][step] = p[action]
+            group_actions_proba[group][step] = action_proba[action]
             # Advance the environment with the sampled action.
             observation, reward, done = env.step(action)
             # Check if this trajectory is done.
@@ -245,10 +243,10 @@ def grpo_objective(
     group_advantages: AdvantageArray,
     grpo_config: GRPOConfig,
 ) -> float:
-    # Each group contributes to the GRPO objective function.
+    # For each trajectory in the given group...
     grpo = 0.0
     for observations, actions_proba, actions, advantage in zip(group_observations, group_actions_proba, group_actions, group_advantages):
-        # Evaluate the policy model on this group's trajectory.
+        # ...accumulate the trajectory's step contributions to the GRPO objective.
         for observation, π_θ_t_old, action in zip(observations, actions_proba, actions):
             π_θ_t = grpo_config.policy(policy_params, observation)[action]
             π_ref_t = grpo_config.reference_policy(observation)[action]
@@ -300,7 +298,7 @@ def train_grpo(optimizer: AdamWOptimizer, grpo_config: GRPOConfig) -> tuple[Para
             # Compute the gradient and update the solution.
             optimizer.step(grpo_objective_batch_grad(optimizer.params, groups, grpo_config))
         # Track progress of the validation reward.
-        groups_val = [collect_group(optimizer.params, replace(grpo_config, G=16, random_state=np.random.RandomState(42 + i))) for i in range(32)]
+        groups_val = [collect_group(optimizer.params, replace(grpo_config, G=16), env_seed=i) for i in range(32)]
         rewards_val[iter] = sum(np.mean(group_val[3]) for group_val in groups_val) / len(groups_val)
         pbar.set_description(f"reward_val={rewards_val[iter]:.3f}")
     return optimizer.params, rewards_val
