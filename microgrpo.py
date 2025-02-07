@@ -180,6 +180,7 @@ RewardArray: TypeAlias = np.ndarray[tuple[int], np.float32]
 AdvantageArray: TypeAlias = np.ndarray[tuple[int], np.float32]
 PolicyFunction: TypeAlias = Callable[[ParamsDict, ObservationArray], ActionProbaArray]
 ReferencePolicyFunction: TypeAlias = Callable[[ObservationArray], ActionProbaArray]
+Group: TypeAlias = tuple[list[list[ObservationArray]], list[ActionProbaArray], list[ActionArray], RewardArray, AdvantageArray]
 
 
 @dataclass
@@ -196,15 +197,7 @@ class GRPOConfig:
     μ: int = 10  # Number of gradient steps per mini-batch
 
 
-def collect_group(
-    policy_params: ParamsDict, grpo_config: GRPOConfig, env_seed: int | None = None
-) -> tuple[
-    list[list[ObservationArray]],
-    list[ActionProbaArray],
-    list[ActionArray],
-    RewardArray,
-    AdvantageArray,
-]:
+def collect_group(policy_params: ParamsDict, grpo_config: GRPOConfig, env_seed: int | None = None) -> Group:
     # Initialize the group output.
     group_observations: list[list[ObservationArray]] = [[] for _ in range(grpo_config.G)]
     group_actions = [np.empty(grpo_config.environment.max_steps, dtype=np.intp) for _ in range(grpo_config.G)]
@@ -236,18 +229,10 @@ def collect_group(
     return (group_observations, group_actions_proba, group_actions, group_rewards, group_advantages)
 
 
-def grpo_objective(
-    policy_params: ParamsDict,
-    group_observations: list[list[ObservationArray]],
-    group_actions_proba: list[ActionProbaArray],
-    group_actions: list[ActionArray],
-    group_rewards: RewardArray,
-    group_advantages: AdvantageArray,
-    grpo_config: GRPOConfig,
-) -> float:
+def grpo_objective(policy_params: ParamsDict, group: Group, grpo_config: GRPOConfig) -> float:
     # For each trajectory in the given group...
     grpo = 0.0
-    for observations, actions_proba, actions, advantage in zip(group_observations, group_actions_proba, group_actions, group_advantages):
+    for observations, actions_proba, actions, _, advantage in zip(*group):
         # ...accumulate the trajectory's step contributions to the GRPO objective.
         for observation, π_θ_t_old, action in zip(observations, actions_proba, actions):
             π_θ_t = grpo_config.policy(policy_params, observation)[action]
@@ -288,7 +273,7 @@ class AdamWOptimizer:
 
 def train_grpo(optimizer: AdamWOptimizer, grpo_config: GRPOConfig) -> tuple[ParamsDict, RewardArray]:
     # Define the GRPO objective for a mini-batch of groups of trajectories.
-    grpo_objective_batch = lambda policy_params, groups, grpo_config: sum(grpo_objective(policy_params, *group, grpo_config) for group in groups)
+    grpo_objective_batch = lambda policy_params, groups, grpo_config: sum(grpo_objective(policy_params, group, grpo_config) for group in groups)  # noqa: E731
     # Define the gradient of the GRPO objective w.r.t. the policy parameters (the first argument of grpo_objective).
     grpo_objective_batch_grad = grad(grpo_objective_batch)
     rewards_val = np.zeros(grpo_config.M, dtype=np.float32)
