@@ -1,3 +1,5 @@
-.mypy_cache/
-.venv/
+.*/
+*.csv
+*.npz
+*.png
 uv.lock

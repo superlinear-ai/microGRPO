@@ -1,17 +1,17 @@
 #!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.13"
-# dependencies = ["autograd~=1.7.0", "numpy~=2.2.2", "tqdm~=4.67.1"]
+# dependencies = ["autograd~=1.8.0", "numpy~=2.3.1", "tqdm~=4.67.1"]
 # ///
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from itertools import count
-from typing import Callable, TypeAlias
 
 import autograd.numpy as np  # This is only a thin wrapper around NumPy...
 from autograd import grad  # ...to enable automatic differentation with `grad`.
-from tqdm.auto import tqdm
+from tqdm.auto import trange
 
 # --- Game ---
 
@@ -20,7 +20,7 @@ from tqdm.auto import tqdm
 # 🚢 = ship present
 # 💦 = missile miss
 # 💥 = missile hit
-BattleshipGameBoard: TypeAlias = np.ndarray[tuple[int, int], np.str_]
+type BattleshipGameBoard = np.ndarray[tuple[int, int], np.str_]
 
 
 @dataclass
@@ -44,7 +44,7 @@ class BattleshipGame:
             board = np.full((rules.board_size, rules.board_size), "🌊", dtype=np.str_)
             for ship_size in ships:
                 if ship_size > rules.board_size:
-                    return
+                    raise ValueError
                 ship_top_left = random_state.randint(low=0, high=rules.board_size - (ship_size - 1), size=2)
                 ship_bottom_right = ship_top_left + 1
                 ship_bottom_right[random_state.randint(low=0, high=2)] += ship_size - 1
@@ -72,8 +72,8 @@ class BattleshipGame:
 
 # --- Environment ---
 
-ActionProbaArray: TypeAlias = np.ndarray[tuple[int], np.float32]
-ObservationArray: TypeAlias = np.ndarray[tuple[int, ...], np.float32]
+type ActionProbaArray = np.ndarray[tuple[int], np.float32]
+type ObservationArray = np.ndarray[tuple[int, ...], np.float32]
 
 
 class Environment(ABC):
@@ -138,7 +138,7 @@ class BattleshipEnv(Environment):
 # --- Policy ---
 
 
-ParamsDict: TypeAlias = dict[str, np.ndarray[tuple[int, ...], np.float32]]
+type ParamsDict = dict[str, np.ndarray[tuple[int, ...], np.float32]]
 
 
 def neural_battleship_policy_init(rules: BattleshipGameRules | None = None, seed: int = 42) -> ParamsDict:
@@ -169,11 +169,11 @@ def neural_battleship_policy(params: ParamsDict, observation: ObservationArray) 
 # --- GRPO ---
 
 
-ActionArray: TypeAlias = np.ndarray[tuple[int], np.intp]
-RewardArray: TypeAlias = np.ndarray[tuple[int], np.float32]
-AdvantageArray: TypeAlias = np.ndarray[tuple[int], np.float32]
-PolicyFunction: TypeAlias = Callable[[ParamsDict, ObservationArray], ActionProbaArray]
-Group: TypeAlias = tuple[list[list[ObservationArray]], list[ActionProbaArray], list[ActionArray], RewardArray, AdvantageArray]
+type ActionArray = np.ndarray[tuple[int], np.intp]
+type RewardArray = np.ndarray[tuple[int], np.float32]
+type AdvantageArray = np.ndarray[tuple[int], np.float32]
+type PolicyFunction = Callable[[ParamsDict, ObservationArray], ActionProbaArray]
+type Group = tuple[list[list[ObservationArray]], list[ActionProbaArray], list[ActionArray], RewardArray, AdvantageArray]
 
 
 @dataclass
@@ -181,12 +181,14 @@ class GRPOConfig:
     environment: type[Environment]
     policy: PolicyFunction
 
-    ε_low: float = 0.9  # Policy ratio clip epsilon (low)
-    ε_high: float = 0.3  # Policy ratio clip epsilon (high)
+    ε_low: float = 0.9  # Clip for decreasing action probabilities
+    ε_high: float = 0.3  # Clip for increasing action probabilities
     G: int = 16  # Number of trajectories per group
     B: int = 4  # Number of groups per mini-batch
-    M: int = 2048  # Number of mini-batches to train on
+    M: int = 2000  # Number of mini-batches to train on
     μ: int = 10  # Number of gradient steps per mini-batch
+    A_norm: bool = True  # Whether to normalize the advantages across the mini-batch (Magistral: True, LOOP: False)
+    learning_rate: float = 4e-4  # The optimizer's learning rate
 
 
 def collect_group(policy_params: ParamsDict, grpo_config: GRPOConfig, env_seed: int | None = None) -> Group:
@@ -217,23 +219,26 @@ def collect_group(policy_params: ParamsDict, grpo_config: GRPOConfig, env_seed: 
                 group_rewards[trajectory] = reward  # GRPO only considers the terminal reward.
                 break
     # Compute the GRPO advantages across the group, but assign them to the actions within each trajectory.
-    group_advantages = group_rewards - np.mean(group_rewards)
+    group_advantages = (grpo_config.G / (grpo_config.G - 1)) * (group_rewards - np.mean(group_rewards))
     return (group_observations, group_actions_proba, group_actions, group_rewards, group_advantages)
 
 
 def grpo_objective(policy_params: ParamsDict, groups: list[Group], grpo_config: GRPOConfig) -> float:
     # Compute the mean and standard deviation of the advantages across the mini-batch.
-    advantages = np.concatenate([group[-1] for group in groups])
-    A_mean, A_std = np.mean(advantages), max(np.std(advantages), np.finfo(np.float32).eps)
+    if grpo_config.A_norm:  # Mistral's Magistral GRPO
+        advantages = np.concatenate([group[-1] for group in groups])
+        A_mean, A_std = np.mean(advantages), max(np.std(advantages), np.finfo(np.float32).eps)
+    else:  # Apple's LOOP GRPO
+        A_mean, A_std = 0.0, 1.0
     # For each group in the mini-batch...
     grpo_batch = 0.0
     for group in groups:
         # For each trajectory in the group...
         grpo_group = 0.0
-        for observations, actions_proba, actions, _, advantage in zip(*group):
+        for observations, actions_proba, actions, _, advantage in zip(*group, strict=False):
             # ...accumulate the trajectory's step contributions to the GRPO objective.
             A_norm = (advantage - A_mean) / A_std
-            for obs, π_θ_t_old, action in zip(observations, actions_proba, actions):
+            for obs, π_θ_t_old, action in zip(observations, actions_proba, actions, strict=False):
                 π_θ_t = grpo_config.policy(policy_params, obs)[action]
                 ratio = π_θ_t / π_θ_t_old
                 clipped_ratio = np.clip(ratio, 1 - grpo_config.ε_low, 1 + grpo_config.ε_high)
@@ -253,7 +258,7 @@ def grpo_objective(policy_params: ParamsDict, groups: list[Group], grpo_config: 
 
 
 class AdamWOptimizer:
-    def __init__(self, params: ParamsDict, learning_rate: float = 3e-4, ß1: float = 0.9, ß2: float = 0.999, ε: float = 1e-8, λ: float = 0.01) -> None:
+    def __init__(self, params: ParamsDict, learning_rate: float = 3e-4, ß1: float = 0.9, ß2: float = 0.999, ε: float = 1e-8, λ: float = 0.01) -> None:  # noqa: PLR0913
         self.params = params
         self.learning_rate = learning_rate
         self.ß1 = ß1
@@ -274,13 +279,14 @@ class AdamWOptimizer:
         self.t += 1
 
 
-def train_grpo(optimizer: AdamWOptimizer, grpo_config: GRPOConfig) -> tuple[ParamsDict, RewardArray]:
+def train_grpo(θ_init: ParamsDict, grpo_config: GRPOConfig) -> tuple[ParamsDict, RewardArray]:
     # Define the gradient of the GRPO objective w.r.t. the policy parameters.
     grpo_objective_grad = grad(grpo_objective)
+    optimizer = AdamWOptimizer(θ_init, learning_rate=grpo_config.learning_rate)
     rewards_val = np.zeros(grpo_config.M, dtype=np.float32)
-    for iter in (pbar := tqdm(range(grpo_config.M))):
+    for i in (pbar := trange(grpo_config.M)):
         # Collect a mini-batch of groups with sufficient variance in the trajectories.
-        all_groups = (collect_group(optimizer.params, grpo_config, env_seed=s) for s in count(start=(iter + 1) * (8 * grpo_config.G)))
+        all_groups = (collect_group(optimizer.params, grpo_config, env_seed=s) for s in count(start=(i + 1) * (8 * grpo_config.G)))
         valid_groups = (group for group in all_groups if np.std(group[3]) >= np.sqrt(np.finfo(group[3].dtype).eps))
         groups = [next(valid_groups) for _ in range(grpo_config.B)]
         # Optimize the GRPO objective determined by the current mini-batch for a few steps.
@@ -288,8 +294,8 @@ def train_grpo(optimizer: AdamWOptimizer, grpo_config: GRPOConfig) -> tuple[Para
             optimizer.step(grpo_objective_grad(optimizer.params, groups, grpo_config))
         # Track progress of the validation reward.
         groups_val = [collect_group(optimizer.params, replace(grpo_config, G=8), env_seed=i) for i in range(64)]
-        rewards_val[iter] = sum(np.mean(group_val[3]) for group_val in groups_val) / len(groups_val)
-        pbar.set_description(f"reward_val={rewards_val[iter]:.3f}")
+        rewards_val[i] = sum(np.mean(group_val[3]) for group_val in groups_val) / len(groups_val)
+        pbar.set_postfix({"reward_val": rewards_val[i]})
     return optimizer.params, rewards_val
 
 
@@ -298,10 +304,10 @@ def train_grpo(optimizer: AdamWOptimizer, grpo_config: GRPOConfig) -> tuple[Para
 
 # Define the environment and the policy model to optimize.
 grpo_config = GRPOConfig(environment=BattleshipEnv, policy=neural_battleship_policy)
-# Initialize the policy model parameters.
-θ_init = neural_battleship_policy_init()
+
 # Train the policy model by maximizing the GRPO objective with AdamW.
-θ_star, rewards_val = train_grpo(AdamWOptimizer(θ_init, learning_rate=3e-4), grpo_config)
+θ_star, rewards_val = train_grpo(θ_init := neural_battleship_policy_init(), grpo_config)
+
 # Save the trained policy model parameters and the validation rewards.
 np.savez("battleship_policy.npz", **θ_star)
 np.savetxt("battleship_rewards.csv", rewards_val, delimiter=",")
