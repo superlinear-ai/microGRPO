@@ -165,13 +165,6 @@ def neural_battleship_policy(params: ParamsDict, observation: ObservationArray) 
     return softmax
 
 
-def reference_battleship_policy(observation: ObservationArray) -> ActionProbaArray:
-    # Fire on any fog of war tile with uniform probability.
-    p = np.ravel((observation == 0.0).astype(np.float32)) + np.sqrt(np.finfo(np.float32).eps)
-    p = p / np.sum(p)
-    return p
-
-
 # --- GRPO ---
 
 
@@ -179,7 +172,6 @@ ActionArray: TypeAlias = np.ndarray[tuple[int], np.intp]
 RewardArray: TypeAlias = np.ndarray[tuple[int], np.float32]
 AdvantageArray: TypeAlias = np.ndarray[tuple[int], np.float32]
 PolicyFunction: TypeAlias = Callable[[ParamsDict, ObservationArray], ActionProbaArray]
-ReferencePolicyFunction: TypeAlias = Callable[[ObservationArray], ActionProbaArray]
 Group: TypeAlias = tuple[list[list[ObservationArray]], list[ActionProbaArray], list[ActionArray], RewardArray, AdvantageArray]
 
 
@@ -187,10 +179,8 @@ Group: TypeAlias = tuple[list[list[ObservationArray]], list[ActionProbaArray], l
 class GRPOConfig:
     environment: type[Environment]
     policy: PolicyFunction
-    reference_policy: ReferencePolicyFunction
 
     ε: float = 0.9  # Policy ratio clip epsilon
-    ß: float = 0.0  # Weight for KL divergence between the policy and the reference policy
     G: int = 16  # Number of trajectories per group
     B: int = 4  # Number of groups per mini-batch
     M: int = 2048  # Number of mini-batches to train on
@@ -236,11 +226,9 @@ def grpo_objective(policy_params: ParamsDict, group: Group, grpo_config: GRPOCon
         # ...accumulate the trajectory's step contributions to the GRPO objective.
         for observation, π_θ_t_old, action in zip(observations, actions_proba, actions):
             π_θ_t = grpo_config.policy(policy_params, observation)[action]
-            π_ref_t = grpo_config.reference_policy(observation)[action]
             ratio = π_θ_t / π_θ_t_old
             clipped_ratio = np.clip(π_θ_t / π_θ_t_old, 1 - grpo_config.ε, 1 + grpo_config.ε)
             grpo += min(ratio * advantage, clipped_ratio * advantage) / len(actions)  # Advantage
-            grpo += -grpo_config.ß * (π_ref_t / π_θ_t - np.log(π_ref_t / π_θ_t) - 1) / len(actions)  # KL divergence
     grpo /= grpo_config.G
     grpo = -grpo  # Flip the sign to turn the maximization problem into a minimization problem.
     return grpo
@@ -291,12 +279,11 @@ def train_grpo(optimizer: AdamWOptimizer, grpo_config: GRPOConfig) -> tuple[Para
     return optimizer.params, rewards_val
 
 
-# Define the environment, the policy model to optimize, and a reference policy model.
-grpo_config = GRPOConfig(
-    environment=BattleshipEnv,
-    policy=neural_battleship_policy,
-    reference_policy=reference_battleship_policy,
-)
+# --- Run ---
+
+
+# Define the environment and the policy model to optimize.
+grpo_config = GRPOConfig(environment=BattleshipEnv, policy=neural_battleship_policy)
 # Initialize the policy model parameters.
 θ_init = neural_battleship_policy_init()
 # Train the policy model by maximizing the GRPO objective with AdamW.
