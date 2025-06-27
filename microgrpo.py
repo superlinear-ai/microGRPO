@@ -228,10 +228,12 @@ def grpo_objective(policy_params: ParamsDict, group: Group, grpo_config: GRPOCon
             π_θ_t = grpo_config.policy(policy_params, observation)[action]
             ratio = π_θ_t / π_θ_t_old
             clipped_ratio = np.clip(π_θ_t / π_θ_t_old, 1 - grpo_config.ε, 1 + grpo_config.ε)
-            grpo += min(ratio * advantage, clipped_ratio * advantage) / len(actions)  # Advantage
-    grpo /= grpo_config.G
-    grpo = -grpo  # Flip the sign to turn the maximization problem into a minimization problem.
-    return grpo
+            grpo += min(ratio * advantage, clipped_ratio * advantage)  # Advantage
+    # Normalize the GRPO objective by the total number of steps in the group.
+    total_steps = sum(len(actions) for actions in group[2])
+    grpo /= max(1, total_steps)
+    # Flip the sign to turn the maximization problem into a minimization problem.
+    return -grpo
 
 
 # --- Train ---
