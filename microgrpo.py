@@ -196,44 +196,55 @@ def collect_group(policy_params: ParamsDict, grpo_config: GRPOConfig, env_seed: 
     # Create a fixed environment initialization seed.
     init_seed = env_seed if env_seed is not None else np.random.randint(2**32)
     # Generate trajectories starting from the initial environment.
-    for group in range(grpo_config.G):
+    for trajectory in range(grpo_config.G):
         # Start a new environment (a game) from a fixed initial seed.
-        env, observation = grpo_config.environment.reset(init_seed=init_seed, step_seed=init_seed * group)
+        env, observation = grpo_config.environment.reset(init_seed=init_seed, step_seed=init_seed * trajectory)
         for step in range(env.max_steps):
             # Evaluate the policy model to obtain the action probability distribution.
             action_proba = grpo_config.policy(policy_params, observation)
             # Sample an action from the policy's action probability distribution.
             action = env.sample_action(action_proba)
             # Update the group output.
-            group_observations[group].append(observation)
-            group_actions[group][step] = action
-            group_actions_proba[group][step] = action_proba[action]
+            group_observations[trajectory].append(observation)
+            group_actions[trajectory][step] = action
+            group_actions_proba[trajectory][step] = action_proba[action]
             # Advance the environment with the sampled action.
             observation, reward, done = env.step(action)
             # Check if this trajectory is done.
             if done:
-                group_rewards[group] = reward  # GRPO only considers the terminal reward.
+                group_rewards[trajectory] = reward  # GRPO only considers the terminal reward.
                 break
     # Compute the GRPO advantages across the group, but assign them to the actions within each trajectory.
-    group_advantages = (group_rewards - np.mean(group_rewards)) / max(np.std(group_rewards), np.finfo(np.float32).eps)
+    group_advantages = group_rewards - np.mean(group_rewards)
     return (group_observations, group_actions_proba, group_actions, group_rewards, group_advantages)
 
 
-def grpo_objective(policy_params: ParamsDict, group: Group, grpo_config: GRPOConfig) -> float:
-    # For each trajectory in the given group...
-    grpo = 0.0
-    for observations, actions_proba, actions, _, advantage in zip(*group):
-        # ...accumulate the trajectory's step contributions to the GRPO objective.
-        for observation, π_θ_t_old, action in zip(observations, actions_proba, actions):
-            π_θ_t = grpo_config.policy(policy_params, observation)[action]
-            ratio = π_θ_t / π_θ_t_old
-            clipped_ratio = np.clip(π_θ_t / π_θ_t_old, 1 - grpo_config.ε, 1 + grpo_config.ε)
-            grpo += min(ratio * advantage, clipped_ratio * advantage)  # Advantage
-    # Normalize the GRPO objective by the total number of steps in the group.
-    total_steps = sum(len(actions) for actions in group[2])
-    grpo /= max(1, total_steps)
+def grpo_objective(policy_params: ParamsDict, groups: list[Group], grpo_config: GRPOConfig) -> float:
+    # Compute the mean and standard deviation of the advantages across the mini-batch.
+    advantages = np.concatenate([group[-1] for group in groups])
+    A_mean, A_std = np.mean(advantages), max(np.std(advantages), np.finfo(np.float32).eps)
+    # For each group in the mini-batch...
+    grpo_batch = 0.0
+    for group in groups:
+        # For each trajectory in the group...
+        grpo_group = 0.0
+        for observations, actions_proba, actions, _, advantage in zip(*group):
+            # ...accumulate the trajectory's step contributions to the GRPO objective.
+            A_norm = (advantage - A_mean) / A_std
+            for obs, π_θ_t_old, action in zip(observations, actions_proba, actions):
+                π_θ_t = grpo_config.policy(policy_params, obs)[action]
+                ratio = π_θ_t / π_θ_t_old
+                clipped_ratio = np.clip(ratio, 1 - grpo_config.ε, 1 + grpo_config.ε)
+                grpo_group += min(ratio * A_norm, clipped_ratio * A_norm)
+        # Normalize by the total number of steps in the group.
+        total_steps = sum(len(actions) for actions in group[2])
+        grpo_group /= max(1, total_steps)
+        # Accumulate the GRPO objective for this group.
+        grpo_batch += grpo_group
+    # Normalize by the number of groups in the mini-batch.
+    grpo_batch /= len(groups)
     # Flip the sign to turn the maximization problem into a minimization problem.
-    return -grpo
+    return -grpo_batch
 
 
 # --- Train ---
@@ -262,10 +273,8 @@ class AdamWOptimizer:
 
 
 def train_grpo(optimizer: AdamWOptimizer, grpo_config: GRPOConfig) -> tuple[ParamsDict, RewardArray]:
-    # Define the GRPO objective for a mini-batch of groups of trajectories.
-    grpo_objective_batch = lambda policy_params, groups, grpo_config: sum(grpo_objective(policy_params, group, grpo_config) for group in groups)  # noqa: E731
-    # Define the gradient of the GRPO objective w.r.t. the policy parameters (the first argument of grpo_objective).
-    grpo_objective_batch_grad = grad(grpo_objective_batch)
+    # Define the gradient of the GRPO objective w.r.t. the policy parameters.
+    grpo_objective_grad = grad(grpo_objective)
     rewards_val = np.zeros(grpo_config.M, dtype=np.float32)
     for iter in (pbar := tqdm(range(grpo_config.M))):
         # Collect a mini-batch of groups of trajectories to learn from.
@@ -273,7 +282,7 @@ def train_grpo(optimizer: AdamWOptimizer, grpo_config: GRPOConfig) -> tuple[Para
         # Optimize the GRPO objective determined by the current mini-batch for a few steps.
         for _ in range(grpo_config.μ):
             # Compute the gradient and update the solution.
-            optimizer.step(grpo_objective_batch_grad(optimizer.params, groups, grpo_config))
+            optimizer.step(grpo_objective_grad(optimizer.params, groups, grpo_config))
         # Track progress of the validation reward.
         groups_val = [collect_group(optimizer.params, replace(grpo_config, G=8), env_seed=i) for i in range(64)]
         rewards_val[iter] = sum(np.mean(group_val[3]) for group_val in groups_val) / len(groups_val)
