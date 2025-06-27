@@ -180,7 +180,8 @@ class GRPOConfig:
     environment: type[Environment]
     policy: PolicyFunction
 
-    ε: float = 0.9  # Policy ratio clip epsilon
+    ε_low: float = 0.9  # Policy ratio clip epsilon (low)
+    ε_high: float = 0.3  # Policy ratio clip epsilon (high)
     G: int = 16  # Number of trajectories per group
     B: int = 4  # Number of groups per mini-batch
     M: int = 2048  # Number of mini-batches to train on
@@ -234,7 +235,7 @@ def grpo_objective(policy_params: ParamsDict, groups: list[Group], grpo_config: 
             for obs, π_θ_t_old, action in zip(observations, actions_proba, actions):
                 π_θ_t = grpo_config.policy(policy_params, obs)[action]
                 ratio = π_θ_t / π_θ_t_old
-                clipped_ratio = np.clip(ratio, 1 - grpo_config.ε, 1 + grpo_config.ε)
+                clipped_ratio = np.clip(ratio, 1 - grpo_config.ε_low, 1 + grpo_config.ε_high)
                 grpo_group += min(ratio * A_norm, clipped_ratio * A_norm)
         # Normalize by the total number of steps in the group.
         total_steps = sum(len(actions) for actions in group[2])
