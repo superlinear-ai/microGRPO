@@ -6,6 +6,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
+from itertools import count
 from typing import Callable, TypeAlias
 
 import autograd.numpy as np  # This is only a thin wrapper around NumPy...
@@ -278,11 +279,12 @@ def train_grpo(optimizer: AdamWOptimizer, grpo_config: GRPOConfig) -> tuple[Para
     grpo_objective_grad = grad(grpo_objective)
     rewards_val = np.zeros(grpo_config.M, dtype=np.float32)
     for iter in (pbar := tqdm(range(grpo_config.M))):
-        # Collect a mini-batch of groups of trajectories to learn from.
-        groups = [collect_group(optimizer.params, grpo_config, env_seed=(iter + 1) * 128 + i) for i in range(grpo_config.B)]
+        # Collect a mini-batch of groups with sufficient variance in the trajectories.
+        all_groups = (collect_group(optimizer.params, grpo_config, env_seed=s) for s in count(start=(iter + 1) * (8 * grpo_config.G)))
+        valid_groups = (group for group in all_groups if np.std(group[3]) >= np.sqrt(np.finfo(group[3].dtype).eps))
+        groups = [next(valid_groups) for _ in range(grpo_config.B)]
         # Optimize the GRPO objective determined by the current mini-batch for a few steps.
         for _ in range(grpo_config.μ):
-            # Compute the gradient and update the solution.
             optimizer.step(grpo_objective_grad(optimizer.params, groups, grpo_config))
         # Track progress of the validation reward.
         groups_val = [collect_group(optimizer.params, replace(grpo_config, G=8), env_seed=i) for i in range(64)]
