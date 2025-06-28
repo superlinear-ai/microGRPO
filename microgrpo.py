@@ -216,6 +216,8 @@ def collect_group(policy_params: ParamsDict, grpo_config: GRPOConfig, env_seed: 
             observation, reward, done = env.step(action)
             # Check if this trajectory is done.
             if done:
+                group_actions[trajectory] = group_actions[trajectory][: step + 1]
+                group_actions_proba[trajectory] = group_actions_proba[trajectory][: step + 1]
                 group_rewards[trajectory] = reward  # GRPO only considers the terminal reward.
                 break
     # Compute the GRPO advantages across the group, but assign them to the actions within each trajectory.
@@ -235,10 +237,10 @@ def grpo_objective(policy_params: ParamsDict, groups: list[Group], grpo_config: 
     for group in groups:
         # For each trajectory in the group...
         grpo_group = 0.0
-        for observations, actions_proba, actions, _, advantage in zip(*group, strict=False):
+        for observations, actions_proba, actions, _, advantage in zip(*group, strict=True):
             # ...accumulate the trajectory's step contributions to the GRPO objective.
             A_norm = (advantage - A_mean) / A_std
-            for obs, π_θ_t_old, action in zip(observations, actions_proba, actions, strict=False):
+            for obs, π_θ_t_old, action in zip(observations, actions_proba, actions, strict=True):
                 π_θ_t = grpo_config.policy(policy_params, obs)[action]
                 ratio = π_θ_t / π_θ_t_old
                 clipped_ratio = np.clip(ratio, 1 - grpo_config.ε_low, 1 + grpo_config.ε_high)
