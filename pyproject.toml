@@ -1,7 +1,19 @@
 [project]
 name = "microGRPO"
-version = "0.0.0"
+version = "0.1.0"
 requires-python = ">=3.13"
+dependencies = [
+    "autograd~=1.8.0",
+    "numpy~=2.3.1",
+    "tqdm~=4.67.1",
+]
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.10.3",
+    "mypy>=1.16.1",
+    "ruff>=0.12.0",
+]
 
 [tool.mypy]
 strict = true
@@ -9,3 +21,11 @@ ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 150
+
+[tool.ruff.format]
+docstring-code-format = true
+skip-magic-trailing-comma = true
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["D", "N806", "PLC2401", "RET504"]
